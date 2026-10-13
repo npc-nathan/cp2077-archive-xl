@@ -41,6 +41,35 @@ bool App::MeshExtension::Load()
     return true;
 }
 
+// The engine reads CMesh::materialEntries — and promotes the weak handles inside them — on its own
+// threads, so writing those fields without the engine's own lock can hand it a half-written handle.
+// psiberx's fix for that class of bug is to hold `Raw::CMesh::MaterialLock` while writing; a few of
+// our writes in the dynamic-material path are still outside any such lock, and this guard closes them.
+//
+// It is deliberately non-blocking: our hooks run inside the engine's own resource post-load path, so
+// if the engine already holds this lock, waiting for it would hang the loader thread (and the game
+// watchdog would kill the process 120 s later). When the lock is busy we fall back to the previous
+// unlocked write — the released behaviour, no worse — and count it, so the log says which case we hit.
+struct MeshMaterialWriteGuard
+{
+    std::unique_lock<Red::SharedSpinLock> lock;
+
+    explicit MeshMaterialWriteGuard(Red::CMesh* aMesh)
+        : lock(Raw::CMesh::MaterialLock::Ref(aMesh), std::try_to_lock)
+    {
+        if (!lock.owns_lock())
+        {
+            static int s_busyCount = 0;
+
+            if (++s_busyCount <= 5)
+            {
+                LogWarning(R"([{}] engine mesh material lock was busy; wrote material entries unlocked.)",
+                           ExtensionName);
+            }
+        }
+    }
+};
+
 bool App::MeshExtension::Unload()
 {
     {
@@ -323,6 +352,8 @@ void App::MeshExtension::ProcessDynamicMaterials(const Core::SharedPtr<DynamicCo
 
         if (chunkName.hash == aContext->sourceMesh->path.hash)
         {
+            MeshMaterialWriteGuard materialWrite(aContext->targetMesh);
+
             auto& materialEntry = aContext->targetMesh->materialEntries[materialIndex];
             materialEntry.material = s_dummyMaterial;
             materialEntry.materialWeak = s_dummyMaterial;
@@ -460,6 +491,8 @@ void App::MeshExtension::ProcessDynamicMaterials(const Core::SharedPtr<DynamicCo
                 continue;
             }
 
+            MeshMaterialWriteGuard sourceWrite(aContext->sourceMesh);
+
             sourceEntry.material = chunk->sourceInstance;
             sourceEntry.materialWeak = chunk->sourceInstance;
         }
@@ -512,6 +545,8 @@ void App::MeshExtension::ProcessDynamicMaterials(const Core::SharedPtr<DynamicCo
                     continue;
                 }
 
+                MeshMaterialWriteGuard sourceWrite(aContext->sourceMesh);
+
                 auto& sourceEntry = aContext->sourceMesh->materialEntries[chunk->sourceIndex];
                 sourceEntry.material = chunk->sourceInstance;
                 sourceEntry.materialWeak = chunk->sourceInstance;
@@ -536,8 +571,12 @@ void App::MeshExtension::FinalizeDynamicMaterial(const Core::SharedPtr<DynamicCo
 
     if (aChunk->materialName == aChunk->templateName)
     {
-        materialEntry.material = aChunk->sourceInstance;
-        materialEntry.materialWeak = aChunk->sourceInstance;
+        {
+            MeshMaterialWriteGuard materialWrite(aContext->targetMesh);
+
+            materialEntry.material = aChunk->sourceInstance;
+            materialEntry.materialWeak = aChunk->sourceInstance;
+        }
 
         if (aContext->sourceState == aContext->targetState)
         {
@@ -559,8 +598,12 @@ void App::MeshExtension::FinalizeDynamicMaterial(const Core::SharedPtr<DynamicCo
     {
         auto materialInstance = CloneMaterialInstance(aContext, aChunk, aChunk->sourceInstance, aJobQueue);
 
-        materialEntry.material = materialInstance;
-        materialEntry.materialWeak = materialInstance;
+        {
+            MeshMaterialWriteGuard materialWrite(aContext->targetMesh);
+
+            materialEntry.material = materialInstance;
+            materialEntry.materialWeak = materialInstance;
+        }
 
         aJobQueue.Dispatch([aContext, aChunk, materialInstance]() {
             if (aChunk->failed)
