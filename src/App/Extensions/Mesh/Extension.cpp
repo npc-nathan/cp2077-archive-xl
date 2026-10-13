@@ -3,6 +3,7 @@
 #include "App/Extensions/ResourcePatch/Extension.hpp"
 #include "App/Utils/Str.hpp"
 #include "Core/Facades/Container.hpp"
+#include "Core/Facades/Log.hpp"
 
 namespace
 {
@@ -63,8 +64,8 @@ struct MeshMaterialWriteGuard
 
             if (++s_busyCount <= 5)
             {
-                LogWarning(R"([{}] engine mesh material lock was busy; wrote material entries unlocked.)",
-                           ExtensionName);
+                Core::Log::Warning(R"([{}] engine mesh material lock was busy; wrote material entries unlocked.)",
+                                   ExtensionName);
             }
         }
     }
